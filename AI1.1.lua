@@ -10,7 +10,7 @@
 	  · 人物绘制：NPC 方框 / 射线 / 信息
 	              玩家 方框 / 射线 / 信息 / 血量
 	              掩体判断（可见绿色，掩体后红色）
-	  · 标点传送：定位 / X Y Z 空格格式坐标传送 / 循环传送 / 标点行走
+	  · 标点传送：定位 / X Y Z 空格格式坐标传送 / 循环传送 / 标点行走 / 范围碰撞箱
 	  · 其他功能：速度 / 高跳 / 无限跳 / 穿墙 / 飞行 V1-V3
 	  · 设置：弹窗缩放 / 透明度 / 提示 / 长宽 / 主界面背景色 / 配置管理
 
@@ -230,7 +230,7 @@ pcall(function() WindUI:SetTheme(THEME_NAME) end)
 -- ============================================================
 local windowConfig = {
 	Title = "AI菜单",
-	Author = "1.1",
+	Author = "1.2",
 	Icon = "wind",
 	Theme = THEME_NAME,
 	Size = UDim2.fromOffset(640, 560),
@@ -261,7 +261,7 @@ if not okWindow or not Window then
 	okWindow, Window = pcall(function()
 		return WindUI:CreateWindow({
 			Title = "AI菜单",
-			Author = "1.1",
+			Author = "1.2",
 			Icon = "wind",
 			Theme = THEME_NAME,
 			Size = UDim2.fromOffset(640, 560),
@@ -414,6 +414,18 @@ local Misc = {
 	FlightPanelScale = 0.65,
 }
 
+-- 标点传送中的范围碰撞箱：尺寸逻辑沿用 BS 源码对 HumanoidRootPart.Size 的处理。
+local Range = {
+	Enabled = false,
+	Size = 15,
+	FilterTeam = true,
+	FilterTeammateNPC = true,
+	FilterNPC = true,
+	Color = Color3.fromRGB(80, 130, 255),
+	Transparency = 0.70, -- 绘制不透明度；数值越高越清晰
+	SizeRow = nil,
+}
+
 -- 设置状态：弹窗缩放、透明度、提示、宽高，以及主界面背景色。
 local PopupSettings = {
 	Scale = 0.5,             -- 默认缩小 50%
@@ -459,6 +471,10 @@ local espObjects = {}
 local coverCache = setmetatable({}, { __mode = "k" })
 local npcCache = {}
 local noclipSaved = {}
+local RangeRuntime = {
+	PartStates = setmetatable({}, { __mode = "k" }),
+	Drawings = setmetatable({}, { __mode = "k" }),
+}
 local lastInfJump = 0
 
 -- 飞行控制状态。三种飞行模式互斥，共用同一个物理控制器，避免叠加力对象。
@@ -1679,18 +1695,28 @@ local function createWaypointValueRow(sectionProxy, config)
 	local dragInputType = nil
 	local controller = {}
 
-	local function quantize(value)
-		value = math.clamp(tonumber(value) or current, minimum, maximum)
+	-- 默认数值条始终受 Min/Max 限制；InputUnbounded=true 时，手动输入及 +/- 按钮只保留下限，不限制上限。
+	-- 滑动条仍严格映射 Min..Max；当前值超出滑动范围时，滑块停在最右端，输入框继续显示实际数值。
+	local function quantize(value, allowAboveMaximum)
+		value = tonumber(value) or current
+		local unbounded = config.InputUnbounded == true and allowAboveMaximum == true
+		if unbounded then
+			value = math.max(value, minimum)
+		else
+			value = math.clamp(value, minimum, maximum)
+		end
 		local steps = math.floor(((value - minimum) / step) + 0.5)
 		local result = minimum + steps * step
 		local decimals = config.Decimals
 		if decimals == nil then decimals = step < 1 and 1 or 0 end
 		local multiplier = 10 ^ decimals
-		return math.clamp(math.floor(result * multiplier + 0.5) / multiplier, minimum, maximum)
+		result = math.floor(result * multiplier + 0.5) / multiplier
+		if unbounded then return math.max(result, minimum) end
+		return math.clamp(result, minimum, maximum)
 	end
 
-	local function render(value)
-		current = quantize(value)
+	local function render(value, allowAboveMaximum)
+		current = quantize(value, allowAboveMaximum == true)
 		local alpha = maximum > minimum and math.clamp((current - minimum) / (maximum - minimum), 0, 1) or 0
 		fill.Size = UDim2.new(alpha, 0, 1, 0)
 		knob.Position = UDim2.new(alpha, 0, 0.5, 0)
@@ -1699,28 +1725,29 @@ local function createWaypointValueRow(sectionProxy, config)
 		end
 	end
 
-	local function commit(value)
+	local function commit(value, allowAboveMaximum)
 		local parsed = tonumber(value)
 		if not parsed or parsed ~= parsed or parsed == math.huge or parsed == -math.huge then
 			notify(config.Title or "数值设置", config.InvalidMessage or "请输入有效数字。", "alert-triangle", 3)
-			render(current)
+			render(current, config.InputUnbounded == true)
 			return
 		end
-		parsed = quantize(parsed)
+		local unbounded = config.InputUnbounded == true and allowAboveMaximum == true
+		parsed = quantize(parsed, unbounded)
 		if config.Callback then config.Callback(parsed) end
-		render(parsed)
+		render(parsed, unbounded)
 	end
 
 	local function updateFromX(x)
 		local width = track.AbsoluteSize.X
 		if width <= 1 then return end
 		local alpha = math.clamp((x - track.AbsolutePosition.X) / width, 0, 1)
-		commit(minimum + alpha * (maximum - minimum))
+		commit(minimum + alpha * (maximum - minimum), false)
 	end
 
-	minus.Activated:Connect(function() commit(current - buttonStep) end)
-	plus.Activated:Connect(function() commit(current + buttonStep) end)
-	input.FocusLost:Connect(function() commit(input.Text) end)
+	minus.Activated:Connect(function() commit(current - buttonStep, config.InputUnbounded == true) end)
+	plus.Activated:Connect(function() commit(current + buttonStep, config.InputUnbounded == true) end)
+	input.FocusLost:Connect(function() commit(input.Text, config.InputUnbounded == true) end)
 	local function beginDrag(inputObject)
 		local kind = inputObject.UserInputType
 		if kind ~= Enum.UserInputType.MouseButton1 and kind ~= Enum.UserInputType.Touch then return end
@@ -1745,7 +1772,7 @@ local function createWaypointValueRow(sectionProxy, config)
 	end))
 
 	function controller:Set(value)
-		render(value)
+		render(value, config.InputUnbounded == true)
 	end
 	function controller:Get()
 		return current
@@ -1753,7 +1780,7 @@ local function createWaypointValueRow(sectionProxy, config)
 	function controller:Destroy()
 		if row and row.Parent then row:Destroy() end
 	end
-	render(current)
+	render(current, config.InputUnbounded == true)
 	return controller
 end
 
@@ -2261,7 +2288,9 @@ end))
 -- NPC 缓存：只遍历 Humanoid，扫描间隔放宽到 3 秒，避免人多时卡住绘制
 task.spawn(function()
 	while running do
-		local need = ESP.NpcBox or ESP.NpcRay or ESP.NpcInfo or ESP.NpcHealth or Aim.Enabled or Aim.Track or Aim.SilentAim
+		local need = ESP.NpcBox or ESP.NpcRay or ESP.NpcInfo or ESP.NpcHealth
+			or Aim.Enabled or Aim.Track or Aim.SilentAim
+			or (Range.Enabled and not Range.FilterNPC)
 		if need then
 			local list = {}
 			local seen = {}
@@ -2637,6 +2666,175 @@ local function isTeammateNPC(model, humanoid)
 		end
 	end
 	return false
+end
+
+-- 范围引擎封装在独立作用域，避免增加主脚本顶层局部变量数量。
+do
+-- 3D 立方体的 8 个角点与 12 条边；以目标 HumanoidRootPart 的 CFrame 为朝向。
+local RANGE_CUBE_CORNERS = {
+	{ -1, -1, -1 }, { 1, -1, -1 }, { -1, 1, -1 }, { 1, 1, -1 },
+	{ -1, -1, 1 }, { 1, -1, 1 }, { -1, 1, 1 }, { 1, 1, 1 },
+}
+local RANGE_CUBE_EDGES = {
+	{ 1, 2 }, { 1, 3 }, { 1, 5 }, { 2, 4 }, { 2, 6 }, { 3, 4 },
+	{ 3, 7 }, { 4, 8 }, { 5, 6 }, { 5, 7 }, { 6, 8 }, { 7, 8 },
+}
+
+local function hideRangeLines(lines)
+	if type(lines) ~= "table" then return end
+	for _, line in ipairs(lines) do
+		if line then pcall(function() line.Visible = false end) end
+	end
+end
+
+local function restoreRangePart(part)
+	local saved = RangeRuntime.PartStates[part]
+	if not saved then return end
+	if part and part.Parent then
+		pcall(function()
+			part.Size = saved.Size
+			part.Transparency = saved.Transparency
+			part.Material = saved.Material
+			part.Color = saved.Color
+			part.CanCollide = saved.CanCollide
+		end)
+	end
+	RangeRuntime.PartStates[part] = nil
+end
+
+local function restoreAllRangeParts()
+	for part in pairs(RangeRuntime.PartStates) do
+		restoreRangePart(part)
+	end
+end
+
+local function removeAllRangeDrawings()
+	for char, lines in pairs(RangeRuntime.Drawings) do
+		for _, line in ipairs(lines) do
+			if line then
+				pcall(function() line.Visible = false end)
+				pcall(function() line:Remove() end)
+			end
+		end
+		RangeRuntime.Drawings[char] = nil
+	end
+end
+
+local function getRangeLines(char)
+	local lines = RangeRuntime.Drawings[char]
+	if not lines then
+		lines = {}
+		RangeRuntime.Drawings[char] = lines
+	end
+	if not DrawingLib then return lines end
+	for index = 1, #RANGE_CUBE_EDGES do
+		if not lines[index] then
+			lines[index] = newDrawing("Line", function(line)
+				line.Thickness = 1.5
+				line.Transparency = Range.Transparency
+				line.Color = Range.Color
+				line.Visible = false
+			end)
+		end
+	end
+	return lines
+end
+
+local function isRangeTargetAllowed(target)
+	if target.plr then
+		return not (Range.FilterTeam and isTeammate(target.plr))
+	end
+	if Range.FilterNPC then return false end
+	if Range.FilterTeammateNPC and isTeammateNPC(target.char, target.char:FindFirstChildOfClass("Humanoid")) then
+		return false
+	end
+	return true
+end
+
+local function updateRangeCubeDrawing(char, rootPart, camera, lines)
+	if not (DrawingLib and camera and rootPart and lines) then
+		hideRangeLines(lines)
+		return
+	end
+	local half = Range.Size * 0.5
+	local projected = {}
+	for index, sign in ipairs(RANGE_CUBE_CORNERS) do
+		local localCorner = Vector3.new(sign[1] * half, sign[2] * half, sign[3] * half)
+		local worldCorner = rootPart.CFrame:PointToWorldSpace(localCorner)
+		projected[index] = camera:WorldToViewportPoint(worldCorner)
+	end
+	for index, edge in ipairs(RANGE_CUBE_EDGES) do
+		local line = lines[index]
+		if line then
+			local a, b = projected[edge[1]], projected[edge[2]]
+			local visible = a and b and a.Z > 0.05 and b.Z > 0.05
+			if visible then
+				line.From = Vector2.new(a.X, a.Y)
+				line.To = Vector2.new(b.X, b.Y)
+				line.Color = Range.Color
+				line.Transparency = Range.Transparency
+				line.Thickness = 1.5
+				line.Visible = true
+			else
+				line.Visible = false
+			end
+		end
+	end
+end
+
+local function updateRangeBoxes(targets)
+	if not Range.Enabled then
+		restoreAllRangeParts()
+		for _, lines in pairs(RangeRuntime.Drawings) do hideRangeLines(lines) end
+		return
+	end
+	local camera = Workspace.CurrentCamera
+	local activeParts, activeChars = {}, {}
+	local hitboxSize = Vector3.new(Range.Size, Range.Size, Range.Size)
+	local partTransparency = 1 - math.clamp(Range.Transparency, 0, 1)
+	for _, target in ipairs(targets) do
+		local char = target.char
+		local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+		local rootPart = char and (char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart)
+		if char and char.Parent and humanoid and humanoid.Health > 0 and rootPart and isRangeTargetAllowed(target) then
+			activeParts[rootPart] = true
+			activeChars[char] = true
+			if not RangeRuntime.PartStates[rootPart] then
+				local ok, saved = pcall(function()
+					return {
+						Size = rootPart.Size,
+						Transparency = rootPart.Transparency,
+						Material = rootPart.Material,
+						Color = rootPart.Color,
+						CanCollide = rootPart.CanCollide,
+					}
+				end)
+				if ok then RangeRuntime.PartStates[rootPart] = saved end
+			end
+			-- 与 BS 的碰撞箱实现一致：把目标根部尺寸扩为 Size × Size × Size。
+			pcall(function()
+				rootPart.Size = hitboxSize
+				rootPart.Transparency = partTransparency
+				rootPart.Material = Enum.Material.Neon
+				rootPart.Color = Range.Color
+				rootPart.CanCollide = false
+			end)
+			local lines = getRangeLines(char)
+			updateRangeCubeDrawing(char, rootPart, camera, lines)
+		end
+	end
+	-- 角色离开目标列表、被过滤或重生时，恢复对应部件原始属性。
+	for part in pairs(RangeRuntime.PartStates) do
+		if not activeParts[part] then restoreRangePart(part) end
+	end
+	for char, lines in pairs(RangeRuntime.Drawings) do
+		if not activeChars[char] then hideRangeLines(lines) end
+	end
+end
+
+RangeRuntime.Update = updateRangeBoxes
+RangeRuntime.RestoreAll = restoreAllRangeParts
+RangeRuntime.RemoveAllDrawings = removeAllRangeDrawings
 end
 
 local function updateTarget(t, cam, vp, rayFrom)
@@ -3040,6 +3238,11 @@ table.insert(connections, RunService.RenderStepped:Connect(function(dt)
 		Aim.TrackFovThickness, Aim.TrackFovTransparency, Aim.TrackShowFov)
 
 	local targets = collectTargets()
+	local rangeOk, rangeErr = pcall(RangeRuntime.Update, targets)
+	if not rangeOk and not RangeRuntime.Warned then
+		RangeRuntime.Warned = true
+		warn("[Neumorph] 范围碰撞箱更新出错：" .. tostring(rangeErr))
+	end
 
 	if DrawingLib then
 		local now = os.clock()
@@ -3800,6 +4003,48 @@ safe("标点管理", function()
 	})
 end)
 
+safe("范围", function()
+	local s = section(WaypointTab, {
+		Title = "范围", Desc = "按 BS 碰撞箱尺寸逻辑扩展目标根部，并绘制 3D 正方体范围", Icon = "box", Opened = true,
+	})
+	s:Toggle({
+		Title = "启用范围", Desc = "开启后为符合过滤条件的目标应用正方体碰撞箱", Icon = "box", Value = Range.Enabled,
+		Callback = function(value) Range.Enabled = value end,
+	})
+	Range.SizeRow = createWaypointValueRow(s, {
+		Name = "RangeSizeControl", Title = "范围数值",
+		Description = "正方体长、宽、高统一使用此数值（studs）；输入框无数值上限，滑动条仍保持 1–100",
+		Min = 1, Max = 100, Step = 1, ButtonStep = 1, Decimals = 0, Value = Range.Size,
+		InputUnbounded = true,
+		Format = function(value) return tostring(math.floor(value + 0.5)) end,
+		InvalidMessage = "请输入大于或等于 1 的有效范围数值。",
+		Callback = function(value) Range.Size = math.max(1, math.floor(tonumber(value) or 15)) end,
+	})
+	s:Toggle({
+		Title = "过滤队友", Desc = "开启后跳过与本地玩家同队的玩家", Icon = "users", Value = Range.FilterTeam,
+		Callback = function(value) Range.FilterTeam = value end,
+	})
+	s:Toggle({
+		Title = "过滤队友 NPC", Desc = "开启后跳过被识别为本地同阵营的 NPC", Icon = "user-round-check", Value = Range.FilterTeammateNPC,
+		Callback = function(value) Range.FilterTeammateNPC = value end,
+	})
+	s:Toggle({
+		Title = "过滤 NPC", Desc = "开启后不对场景 NPC 应用范围碰撞箱", Icon = "bot-off", Value = Range.FilterNPC,
+		Callback = function(value) Range.FilterNPC = value end,
+	})
+	s:Colorpicker({
+		Title = "范围绘制颜色", Desc = "设置正方体碰撞箱的颜色，默认蓝色", Icon = "palette", Default = Range.Color,
+		Callback = function(color) Range.Color = color end,
+	})
+	s:Slider({
+		Title = "范围绘制透明度", Desc = "100% 最清晰，0% 完全透明",
+		IsTooltip = true, IsTextbox = true,
+		Value = { Min = 0, Max = 100, Default = 70 }, Step = 1,
+		Callback = function(value) Range.Transparency = math.clamp(tonumber(value) or 70, 0, 100) / 100 end,
+	})
+	gap(WaypointTab)
+end)
+
 
 -- ============================================================
 -- 15. 界面：其他功能（第 5 大分类）
@@ -4119,12 +4364,19 @@ local ConfigBindings = {
 	{ id="Misc|飞行持续上升", group="Misc", field="FlightAscend", kind="boolean" },
 	{ id="Misc|飞行持续下降", group="Misc", field="FlightDescend", kind="boolean" },
 
+	{ id="Waypoint|启用范围", group="Range", field="Enabled", kind="boolean" },
+	{ id="Waypoint|范围数值", group="Range", field="Size", kind="number" },
+	{ id="Waypoint|过滤队友", group="Range", field="FilterTeam", kind="boolean" },
+	{ id="Waypoint|过滤队友 NPC", group="Range", field="FilterTeammateNPC", kind="boolean" },
+	{ id="Waypoint|过滤 NPC", group="Range", field="FilterNPC", kind="boolean" },
+	{ id="Waypoint|范围绘制颜色", group="Range", field="Color", kind="color" },
+	{ id="Waypoint|范围绘制透明度", group="Range", field="Transparency", kind="number", toUI=function(value) return value * 100 end },
 }
 
 local function buildConfigSnapshot()
 	local data = {
-		Version = 3,
-		Aim = {}, ESP = {}, Misc = {},
+		Version = 4,
+		Aim = {}, ESP = {}, Misc = {}, Range = {},
 		UI = {
 			PopupScale = PopupSettings.Scale,
 			PopupTransparency = PopupSettings.Transparency,
@@ -4148,7 +4400,7 @@ local function buildConfigSnapshot()
 		end
 	end
 	for _, binding in ipairs(ConfigBindings) do
-		local source = ({ Aim=Aim, ESP=ESP, Misc=Misc })[binding.group]
+		local source = ({ Aim=Aim, ESP=ESP, Misc=Misc, Range=Range })[binding.group]
 		local value = source[binding.field]
 		if binding.kind == "color" then value = colorToTable(value) end
 		data[binding.group][binding.field] = value
@@ -4219,7 +4471,7 @@ local function loadConfig()
 		notify("加载配置失败", "配置文件不存在或内容损坏：" .. tostring(lastReadError or "未找到配置文件"), "alert-triangle", 5)
 		return
 	end
-	local stateGroups = { Aim=Aim, ESP=ESP, Misc=Misc }
+	local stateGroups = { Aim=Aim, ESP=ESP, Misc=Misc, Range=Range }
 	for _, binding in ipairs(ConfigBindings) do
 		local groupData = data[binding.group]
 		local value = type(groupData) == "table" and groupData[binding.field] or nil
@@ -4280,6 +4532,10 @@ local function loadConfig()
 	Aim.AimFovTransparency = math.clamp(tonumber(Aim.AimFovTransparency) or 0.8, 0, 1)
 	Aim.TrackFovTransparency = math.clamp(tonumber(Aim.TrackFovTransparency) or 0.8, 0, 1)
 	if Aim.SilentAim and not installSilentAimHook() then Aim.SilentAim = false end
+
+	Range.Size = math.max(1, math.floor(tonumber(Range.Size) or 15))
+	Range.Transparency = math.clamp(tonumber(Range.Transparency) or 0.70, 0, 1)
+	if Range.SizeRow then pcall(function() Range.SizeRow:Set(Range.Size) end) end
 
 	Misc.FlightPanelScale = math.clamp(tonumber(Misc.FlightPanelScale) or 0.65, 0.35, 1)
 	Misc.FlightV1Speed = math.clamp(tonumber(Misc.FlightV1Speed) or 50, 1, 500)
@@ -4369,6 +4625,7 @@ local function loadConfig()
 	pcall(function() if UIBackgroundColorControl and UIBackgroundColorControl.Set then UIBackgroundColorControl:Set(UISettings.BackgroundColor) end end)
 	pcall(function() if UIBackgroundTransparencyControl and UIBackgroundTransparencyControl.Set then UIBackgroundTransparencyControl:Set(UISettings.BackgroundTransparency * 100) end end)
 	refreshESPNow()
+	pcall(RangeRuntime.Update, collectTargets())
 	-- 启动配置中的飞行模式（若多个模式同时为 true，则按 V3 > V2 > V1 处理）。
 	-- 老版本配置可能包含“持续上升/持续下降”字段，升级后忽略并清零。
 	Misc.FlightAscend, Misc.FlightDescend = false, false
@@ -4709,7 +4966,7 @@ safe("首页快速导航", function()
         Icon = "eye", Justify = "Between", Callback = function() goTo(EspTab, 3) end,
     })
     s:Button({
-        Title = "标点传送", Desc = "保存坐标、传送、循环传送与标点行走",
+        Title = "标点传送", Desc = "保存坐标、传送、循环传送、标点行走与范围碰撞箱",
         Icon = "map-pin", Justify = "Between", Callback = function() goTo(WaypointTab, 4) end,
     })
     s:Button({
@@ -4863,6 +5120,9 @@ cleanup = function()
 	for _, obj in pairs(espObjects) do destroyESP(obj) end
 	espObjects = {}
 	coverCache = setmetatable({}, { __mode = "k" })
+	Range.Enabled = false
+	RangeRuntime.RestoreAll()
+	RangeRuntime.RemoveAllDrawings()
 
 	silentAimTarget = nil
 	Aim.SilentAim = false
@@ -4903,7 +5163,7 @@ task.delay(0.8, function()
 	if #buildErrors > 0 then
 		notify("脚本已启动，但部分界面加载失败", table.concat(buildErrors, " | "), "alert-triangle", 10)
 	else
-		notify("Neumorph已加载", "首页已就绪；包含自瞄追踪、人物绘制、标点传送、其他功能（含飞行 V1-V3）和设置。", "check", 6)
+		notify("Neumorph已加载", "首页已就绪；包含自瞄追踪、人物绘制、标点传送（含范围碰撞箱）、其他功能和设置。", "check", 6)
 	end
 end)
 
